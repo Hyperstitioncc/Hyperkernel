@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+H=${QWEN30B_HOME:-$ROOT/.qwen30b}
+BUNDLE=${QWEN30B_BUNDLE:-$ROOT/kernels/b300/qwen30b-train}
+BIN=$ROOT/target/release/qwen30b_train
+TOKEN_COUNT=400000000
+
+die() { echo "qwen30b: $*" >&2; exit 1; }
+say() { echo "qwen30b: $*"; }
+
+cmd_help() {
+  cat <<'TXT'
+qwen30b: a prebuilt Qwen3-30B-A3B training kernel (48 layers, BF16, global batch 64 x 2048) on 8 B300 GPUs, read-only.
+You get its machine code (entry.cubin) and disassembly (entry.sass), the numbers that load it, and this loader.
+
+  qwen30b run --model DIR --out DIR [--tokens FILE] [--warmup 20] [--steps 60]
+      fetches what is missing, unpacks and checks the cubin, loads it on all 8 GPUs, trains, and writes DIR/result.txt:
+      step time (rank-0 median, and every rank's median), tokens/s per GPU, MFU, the last loss
+  qwen30b fetch --model DIR [--tokens FILE]
+      Qwen/Qwen3-30B-A3B at ad44e777bcd18fa416d9da3bd8f70d33ebb85d39 (about 60 GB) and FineWeb-Edu sample/10BT tokenized
+      in order, each document then <|endoftext|>, 400M ids (1.6 GB; default DIR/tokens_u32.bin)
+  qwen30b check --model DIR [--tokens FILE]
+      the bundle's hashes, then every rank's memory fills against the bundle's digests on the CPU (QWEN30B_THREADS)
+  qwen30b verify
+      unpacks entry.cubin and entry.sass, checks their sha256 against reference.json, and diffs entry.sass with
+      `nvdisasm -c entry.cubin` (CUDA 13.4.92). By hand: zstd -d entry.cubin.zst entry.sass.zst; sha256sum entry.*;
+      nvdisasm -c entry.cubin | diff - entry.sass
+
+Needs exactly 8 idle B300 GPUs (driver R580+, about 232 GB each); other hosts are refused. A step that does not finish in
+time ends the run with a HANG line and no result: such hangs happen intermittently; run again.
+
+MFU = flops_per_token (reference.json: 6 x active parameters + 6 x layers x heads x head dim x 2048) x 64 x 2048
+      / step time / (8 x 2.25 PFLOP/s, NVIDIA's dense BF16 peak for B300).
+Measured with this package: 491.58 ms, 30.6%.
+
+TXT
+}
+
+toolchain() {
+  export RUSTUP_HOME=${RUSTUP_HOME:-$H/rustup} CARGO_HOME=${CARGO_HOME:-$H/cargo} PATH="${CARGO_HOME:-$H/cargo}/bin:$PATH"
+  if ! command -v cargo >/dev/null; then
+    mkdir -p "$H"
+    curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
+  fi
+}
+
+build() {
+  toolchain
+  (cd "$ROOT" && cargo build --release --bin qwen30b_train)
+}
+
+venv() {
+  local d=$H/fetch
+  if [ ! -x "$d/bin/python" ]; then
+    mkdir -p "$H"
+    python3 -m venv "$d" 2>/dev/null || {
+      rm -rf "$d"
+      [ -x "$H/uv/uv" ] || curl -fsSL https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$H/uv" UV_NO_MODIFY_PATH=1 sh
+      "$H/uv/uv" venv -q --python python3 "$d"; }
+    if [ -x "$d/bin/pip" ]; then "$d/bin/pip" install -q huggingface_hub tokenizers pyarrow numpy
+    else "$H/uv/uv" pip install -q --python "$d/bin/python" huggingface_hub tokenizers pyarrow numpy; fi
+  fi
+}
+
+parse() {
+  MODEL=""; TOKENS=""; OUT=""; WARMUP=20; STEPS=60
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --model) MODEL=$2; shift 2 ;; --tokens) TOKENS=$2; shift 2 ;; --out) OUT=$2; shift 2 ;;
+      --warmup) WARMUP=$2; shift 2 ;; --steps) STEPS=$2; shift 2 ;;
+      *) die "unknown argument '$1'" ;;
+    esac
+  done
+  [ -n "$MODEL" ] || die "--model DIR is required"
+  TOKENS=${TOKENS:-$MODEL/tokens_u32.bin}
+}
+
+hashes() {
+  [ -s "$BUNDLE/reference.json.zst" ] || die "no kernel bundle at $BUNDLE"
+}
+
+unpack() {
+  local d=$1 f want
+  "$BIN" --bundle "$BUNDLE" --model . --tokens . --out "$d" --unpack "$d"
+  for f in entry.cubin entry.sass; do
+    want=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["files"][sys.argv[2]]["sha256"])' "$d/reference.json" "$f")
+    [ "$(sha256sum "$d/$f" | cut -d' ' -f1)" = "$want" ] || die "$d/$f does not match its sha256 in reference.json"
+  done
+}
+
+fetch() {
+  local have=0; ls "$MODEL"/*.safetensors >/dev/null 2>&1 && [ -s "$TOKENS" ] && have=1
+  if [ $have = 1 ] && [ "$(stat -c %s "$TOKENS")" -ge $((TOKEN_COUNT * 4)) ]; then return 0; fi
+  command -v python3 >/dev/null || die "python3 is required"
+  venv
+  mkdir -p "$MODEL"; say "fetching into $MODEL and $TOKENS (HF_TOKEN helps if the host is rate-limited)"
+  "$H/fetch/bin/python" -I "$ROOT/scripts/qwen30b/fetch.py" "$MODEL" "$TOKENS" "$TOKEN_COUNT" "$H/parquet"
+}
+
+preflight() {
+  command -v nvidia-smi >/dev/null || die "no nvidia-smi (NVIDIA driver)"
+  local n names drv apps mem
+  n=$(nvidia-smi -L | wc -l); [ "$n" = 8 ] || die "this host shows $n GPUs: the kernel runs on exactly 8"
+  names=$(nvidia-smi --query-gpu=name --format=csv,noheader | sort -u | tr '\n' ' ')
+  [ "$(nvidia-smi --query-gpu=name --format=csv,noheader | grep -vc B300 || true)" = 0 ] || die "GPUs are '$names': the kernel targets NVIDIA B300 (sm_103a) only"
+  drv=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
+  [ "${drv%%.*}" -ge 580 ] 2>/dev/null || die "driver $drv: needs R580 or newer (CUDA 13.0)"
+  apps=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -c . || true)
+  mem=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | awk '$1 > 200' | wc -l)
+  [ "$apps" = 0 ] && [ "$mem" = 0 ] || die "GPUs are busy ($apps compute processes, $mem GPUs holding over 200 MiB): the timing needs the whole node"
+  say "preflight: 8 x $names driver $drv"
+}
+
+cmd_fetch() { parse "$@"; fetch; say "data ready: $MODEL, $TOKENS"; }
+
+cmd_check() {
+  parse "$@"; hashes; build; fetch
+  "$BIN" --dry --bundle "$BUNDLE" --model "$MODEL" --tokens "$TOKENS" --out "$H/dry" ${QWEN30B_THREADS:+--threads "$QWEN30B_THREADS"}
+}
+
+cmd_verify() {
+  hashes; build
+  command -v nvdisasm >/dev/null || die "no nvdisasm on PATH (CUDA toolkit, or the nvidia-cuda-nvdisasm wheel)"
+  local d=$H/verify
+  unpack "$d"; sha256sum "$d/entry.cubin" "$d/entry.sass"
+  nvdisasm -c "$d/entry.cubin" | diff -q - "$d/entry.sass" >/dev/null || die "entry.sass is not this nvdisasm's output for entry.cubin (another nvdisasm version may format differently)"
+  say "entry.sass is nvdisasm's output for entry.cubin"
+}
+
+cmd_run() {
+  parse "$@"; [ -n "$OUT" ] || die "--out DIR is required"
+  hashes; preflight; build; fetch
+  mkdir -p "$OUT" "$H/tmp"; OUT=$(cd "$OUT" && pwd); MODEL=$(cd "$MODEL" && pwd); TOKENS=$(readlink -f "$TOKENS")
+  unpack "$OUT/kernel"
+  local log=$OUT/run.log tele=$OUT/telemetry.csv code=0
+  nvidia-smi --query-gpu=timestamp,index,power.draw,clocks.sm,utilization.gpu,memory.used --format=csv,noheader -l 5 > "$tele" 2>/dev/null &
+  trap "kill $! 2>/dev/null || true" EXIT
+  say "$WARMUP warmup + $STEPS timed steps; log $log"
+  env -i PATH="/usr/bin:/bin" HOME="$H" TMPDIR="$H/tmp" RUST_BACKTRACE=1 \
+    "$BIN" --bundle "$BUNDLE" --model "$MODEL" --tokens "$TOKENS" --out "$OUT" --cubin "$OUT/kernel/entry.cubin" --warmup "$WARMUP" --steps "$STEPS" 2>&1 | tee "$log" || code=$?
+  if grep -q '^HANG' "$log"; then die "the run hung, no result; see above. Telemetry: $tele"; fi
+  [ "$code" = 0 ] && grep -q '^MFU:' "$log" || die "the run failed (exit $code), no result; see $log"
+  grep -E '^(model|last outputs|step ms|tokens/s|MFU)' "$log" > "$OUT/result.txt"
+  say "result in $OUT/result.txt"
+}
+
+case ${1:-} in
+  fetch) shift; cmd_fetch "$@" ;; run) shift; cmd_run "$@" ;; check) shift; cmd_check "$@" ;; verify) cmd_verify ;;
+  *) cmd_help; exit 2 ;;
+esac
